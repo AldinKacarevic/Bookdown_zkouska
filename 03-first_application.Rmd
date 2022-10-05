@@ -1,0 +1,285 @@
+# Aplikace metody DID: Metro A [deskriptivní analýza]
+
+```{r setup, include=FALSE, warning=FALSE, echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	include = TRUE)
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, echo=TRUE, message=FALSE)
+```
+
+
+
+```{r, echo=FALSE}
+library(tidyverse)
+library(sf)
+library(ggspatial)
+library(tmap)
+library(car)
+library(leaflet)
+library(rjson)
+library(purrr)
+library(RColorBrewer)
+library(janitor)
+library(skimr)
+library(arm)
+library(reshape2)
+library(stats)
+library(knitr)
+library(broom)
+library(lmtest)
+library(lubridate)
+library(stargazer)
+library(viridis)
+library(ggpubr)
+```
+
+
+## Úvod
+Modely měřicí přínos nových stanic linek metra byly použity na datech k prodloužení linky metra A (rok uvedení do provozu 2015). Data k nájmům jsou sbírána za roky 2014 - 2020.Konkrétně se jedná o nemovitosti z okolí stanic: Bořislavka, Nádraží Veleslavín, Petřin a Motol. 
+Experimentální a kontrolní skupiny byly vymezeny na principu vzdálenosti od nových stanic. Konkrétně byly specifikovány následujícím způsobem:
+
+* Experimentální (0-600m), Kontrolní (800-2000m)
+
+* Experimentální (0-800m), Kontrolní (800-2000m)
+
+* Experimentální (0-1000m), Kontrolní (1200-2000m)
+
+Skupiny byly zároveň definovány tak, aby žádné pozorování nemohlo připadnou současně do experimentální a kontrolní skupiny, ale ani do dvou kontrolních skupin současně.
+K nájmům (v datasetu vedeno jako proměnná cena) byly připojeny data o atributech rodinných domů a bytů (typ obydlí reprezentuje proměnná typ: 0 = rodinný dům, 1 = byt) a dále byla vytvořena kvartální proměnná času. Klíčové jsou především binární proměnné pred_po (0 = pozorování se nachází v období před intervencí, 1 = pozorování se nachází po intervenci) vytvořená rozdílem proměnných rok_nájmu - rok_projektu, proměnná nova_stara (0 = pozorování patří do kontrolní skupiny, 1 = pozorování patří do experimentální skupiny), číslo připojené k proměnné nova_stara (například nova_stara_100) pak značí způsob definování experimentální skupiny. Interakcí těchto dvou proměnných následně vznikla hlavní diff-in-diff proměnná pred_po*nova_stara měřící efekt intervence.
+
+```{r echo=FALSE}
+# Loading data  
+
+dt_metro_najmy<-readxl::read_excel("vstupy/20211109_Experimentalni_kontrolni_metro_promenne_najmy.xlsx")
+```
+
+
+## Úprava dat - rozklíčování proměnných s atributy
+
+```{r}
+if(exists("bit_mask")){rm(bit_mask)}
+   for(a1 in c(0,1)){
+     for(a2 in c(0,1)){
+       for(a4 in c(0,1)){
+         for(a8 in c(0,1)){
+           for(a16 in c(0,1)){
+             for(a32 in c(0,1)){
+               for(a64 in c(0,1)){
+                 for(a128 in c(0,1)){
+                   bit_mask_temp <- data.frame(1*a1 + 2*a2 + 4*a4 + 8*a8 + 16*a16 + 32*a32 + 64*a64 + 128*a128, a1,a2,a4,a8,a16,a32,a64,a128)
+                   if(!exists("bit_mask")){
+                     bit_mask <- bit_mask_temp
+                   }else{
+                     bit_mask <- rbind(bit_mask, bit_mask_temp)
+                   }
+                 }
+               }
+             }
+           }
+         }
+       }
+     }
+   }
+   rm(a1, a2, a4, a8, a16, a32, a64, a128, bit_mask_temp)
+   colnames(bit_mask) <- c("bit", "balcony", "parking_space", "equiped", "loggia", "elevator", "barrier_free", "garage", "terrace")
+  dt_metro_najmy <- merge(dt_metro_najmy, bit_mask, by.x = "atributy", by.y = "bit")
+
+
+# uprava promennych s charakteristikami 
+dt_metro_najmy_temp<-as.data.frame(sapply(dt_metro_najmy[,7:14],as.character))
+dt_metro_najmy[,7:14] <- dt_metro_najmy_temp
+
+
+## Tvorba binarni promenne indikujici experimentalni = 1, kontrolni = 0 skupinu.
+
+dt_metro_najmy<-dt_metro_najmy%>%
+  mutate(nova_stara_600 = ifelse(ToBreak>0.6, 0,1)) %>%
+  mutate(nova_stara_800 = ifelse(ToBreak>0.8, 0,1)) %>%
+  mutate(nova_stara_1000 = ifelse(ToBreak>1, 0,1)) %>%
+  mutate(nova_stara = ifelse(rok_projekt == 2015, 1, 0))%>% # Additional - not used
+  mutate(cena_trend = rok_najem - rok_projekt)%>% # promenna urcena k vykresleni trendu
+  mutate(pred_po = rok_najem - rok_projekt)%>%
+  filter(pred_po < 0 | pred_po > 0 )%>%
+  mutate(pred_po = ifelse(pred_po > 0, 1, 0)) %>%
+  filter(NAZEV != "Motol - vestibul") %>% # Filter out pozorovani z motola
+  filter(stavobjekt != "51") %>% # smazani nemovitosti v projektove fazi
+  filter(stavobjekt != "60")  # smazani nemovitosti ve vystavbe
+
+## Uprava dalsich promennych - atributu budov a lokalit
+dt_metro_najmy<-dt_metro_najmy %>%
+  mutate(budova = ifelse(budova == "45", 1, 0))
+  
+## Rozklicovani promennych
+dt_metro_najmy<-dt_metro_najmy%>%
+  mutate(vlastnictv = ifelse(vlastnictv == "61", "Osobni",
+                                ifelse(vlastnictv == "62","Druzstevni",
+                                       ifelse(vlastnictv == "63", "Jine",
+                                              ifelse(vlastnictv == "78","Obecni", "NA")))))%>%
+  mutate(stavobjekt = ifelse(stavobjekt =="52", "Po rekonstrukci",
+                             ifelse(stavobjekt == "53", "Dobry",
+                                    ifelse(stavobjekt == "54", "Velmi dobry",
+                                           ifelse(stavobjekt =="55","Pred rekonstrukci",
+                                                  ifelse(stavobjekt == "56","Novostavba",
+                                                         ifelse(stavobjekt == "58","Spatny",
+                                                                ifelse(stavobjekt == "59","K demolici", "NA")))))))) 
+dt_metro_najmy<-dt_metro_najmy%>%
+           mutate(stavobjekt = as.factor(stavobjekt)) %>%
+           mutate(vlastnictv = as.factor(vlastnictv))
+  
+  
+
+# Uprava promenych 
+dt_metro_najmy<-dt_metro_najmy%>%
+  mutate(plochauzit = as.numeric(plochauzit)) %>%
+  mutate(typ = ifelse(typ == "byt", 1,0)) %>% # pro byt = 1, pro RD = 0
+  mutate(stanice = as.factor(NAZEV))
+  
+  
+```
+
+
+V datasetu je vytvořená kvadrální proměnná a je vytvořen subset s transakcemi v okolí nové linky metra.
+```{r}
+kvartal = function(dt) {
+  d = substr(dt, 1, 10)
+  d1 = date(d)
+  m = month(d1)
+  y = year(d1)
+  d2 = case_when(
+    m %in% c(1,2,3) ~ "Q1",
+    m %in% c(4,5,6) ~ "Q2",
+    m %in% c(7,8,9) ~ "Q3",
+    m %in% c(10,11,12) ~ "Q4",
+    TRUE ~ "F"
+  )
+  d3 = paste(y, d2, sep = "")
+  return(d3)
+}
+
+
+
+dt_metro_najmy = dt_metro_najmy %>% 
+  dplyr::mutate(qq = kvartal(lastfound_))
+ 
+
+# Vytvoreni datasetu distance
+dt_metro_najmy_dist<-subset(dt_metro_najmy, NAZEV == "Bořislavka - Horoměřická" | NAZEV == "Veleslavín - vestibul" | NAZEV == "Petřiny - vestibul" | NAZEV == "Bořislavka - Arabská" ) 
+
+```
+
+## Průzkum dat - počet pozorování okolo stanic A vs zbytek
+## Histogram cen
+
+```{r}
+ggplot(dt_metro_najmy, aes(x = cena))+
+  geom_histogram(breaks = seq(0,70000, by = 100))
+
+ggplot(dt_metro_najmy, aes(x = log(cena)))+
+  geom_histogram(breaks = seq(7,14, by = 0.05))
+``` 
+
+
+## Pocet pozorovani
+```{r}
+
+# Skupiny pozorovani do 2km
+obs<-c(nrow(filter(dt_metro_najmy_dist, nova_stara_600 == 1 )), 
+       mean(filter(dt_metro_najmy_dist, nova_stara_600 == 1 )$cena),
+       nrow(filter(dt_metro_najmy_dist, nova_stara_600 == 0 )),
+       mean(filter(dt_metro_najmy_dist, nova_stara_600 == 0 )$cena),
+       nrow(filter(dt_metro_najmy_dist, nova_stara_800 == 1 )), 
+       mean(filter(dt_metro_najmy_dist, nova_stara_800 == 1 )$cena),
+       nrow(filter(dt_metro_najmy_dist, nova_stara_800 == 0 )),
+       mean(filter(dt_metro_najmy_dist, nova_stara_800 == 0 )$cena),
+       nrow(filter(dt_metro_najmy_dist, nova_stara_1000 == 1 )), 
+       mean(filter(dt_metro_najmy_dist, nova_stara_1000 == 1 )$cena),
+       nrow(filter(dt_metro_najmy_dist, nova_stara_1000 == 0 )),
+       mean(filter(dt_metro_najmy_dist, nova_stara_1000 == 0 )$cena))
+cols<-c("Počet pozorování exp. skup.","Průměrná cena", "Počet pozorování kont. skup.","Průměrná cena")
+rows<-c("600 m","800 m","1000 m")
+
+obs_temp<-matrix(obs, nrow = 3,ncol = 4, dimnames = list(rows,cols),byrow = TRUE)
+
+kable(obs_temp, caption = "Počet pozorování podle skupiny",  align=rep('c', 5))
+
+
+```
+### Prostorové zobrazení dat
+```{r, message=FALSE}
+
+dt_metro_sf_temp<-dt_metro_najmy_dist[,c("X","Y","nova_stara_600")]
+
+metro_najmy_sf<-st_as_sf(dt_metro_najmy_dist,
+                        coords = c("X","Y"),
+                         crs = 5514, 
+                        agr = "constant")
+
+
+
+metro_najmy_sf$skupina = case_when(
+metro_najmy_sf$nova_stara_600 == 1 ~ "experimentální",
+metro_najmy_sf$nova_stara_600 == 0 ~ "kontrolní")
+
+
+tmap_mode("view")
+tm_shape(metro_najmy_sf) +
+  tm_bubbles(col = "nova_stara_600", scale = 0.01) +
+  tm_view(set.view = c(14.3528789, 50.0931344, 12))
+
+
+```
+### Cenové trendy
+```{r}
+
+## Metro: Distance 
+
+ceny_summary_dist_600<-dt_metro_najmy_dist%>%
+  group_by(cena_trend,nova_stara_600)%>%
+  summarize(cena_prumer = mean(cena))
+
+ceny_summary_dist_800<-dt_metro_najmy_dist%>%
+  group_by(cena_trend,nova_stara_800)%>%
+  summarize(cena_prumer = mean(cena))
+
+ceny_summary_dist_1000<-dt_metro_najmy_dist%>%
+  group_by(cena_trend,nova_stara_1000)%>%
+  summarize(cena_prumer = mean(cena))
+
+ceny_summary<-ceny_summary_dist_600
+ceny_summary$cena_prumer_800<-ceny_summary_dist_800$cena_prumer
+ceny_summary$cena_prumer_1000<-ceny_summary_dist_1000$cena_prumer
+colnames(ceny_summary)<-c("pred_po","nova_stara","cena_prumer_600","cena_prumer_800","cena_prumer_1000")
+
+#ceny_summary_distance$ceny_index<-0
+
+ #for (i in 1:nrow(ceny_summary_distance)) {
+  #  ceny_summary_distance$ceny_index[i]<-ifelse(ceny_summary_distance$nova_stara_600[i]==0, ceny_summary_distance$cena_prumer[i] / # ceny_summary_distance$cena_prumer[1],ceny_summary_distance$cena_prumer[i] / ceny_summary_distance$cena_prumer[2])
+    
+    
+  #}
+
+#ceny_summary_distance<-ceny_summary_distance%>%
+ # mutate(ceny_index = (ceny_index - 1)*100)
+
+## Graf cen pro skupiny Distance: 600, 800, 1000
+theme_set(theme_bw())
+gg_cena_prumer_distance<-ggplot()+
+  geom_line(ceny_summary_dist_600, mapping = aes(x=cena_trend, y = cena_prumer, group = as.factor(nova_stara_600), colour = as.factor(nova_stara_600)))+
+  geom_line(ceny_summary_dist_800, mapping = aes(x=cena_trend, y = cena_prumer, group = as.factor(nova_stara_800), colour = as.factor(nova_stara_800))) +
+  geom_line(ceny_summary_dist_1000, mapping = aes(x=cena_trend, y = cena_prumer, group = as.factor(nova_stara_1000), colour = as.factor(nova_stara_1000)))+
+  scale_x_continuous(breaks = ceny_summary_dist_600$cena_trend)+
+  scale_color_manual(name = "Skupina",
+                     labels = c("Kontrolní skupina","Experimentální skupina"),
+                     values = c("darkblue","red"))+
+                 # theme(axis.text.x = element_text(angle = 60))+
+  ylab("Průměrné ceny")+
+  xlab("Rok")+
+  labs(title = "Vývoj průměrných cen dle skupin v čase")
+  
+
+gg_cena_prumer_distance
+
+```
+
